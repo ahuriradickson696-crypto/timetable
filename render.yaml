@@ -1,5 +1,4 @@
 services:
-  # ─── BACKEND ─────────────────────────
   - type: web
     name: aviu-backend
     runtime: python
@@ -18,11 +17,9 @@ services:
       - key: SECRET_KEY
         generateValue: true
       - key: ACCESS_TOKEN_EXPIRE_MINUTES
-        value: "1440"
-      - key: FRONTEND_URL
+        value: "1440"`n      - key: FRONTEND_URL
         sync: false
 
-  # ─── FRONTEND ────────────────────────
   - type: web
     name: aviu-frontend
     runtime: static
