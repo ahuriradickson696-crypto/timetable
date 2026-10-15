@@ -23,3 +23,7 @@ dist/
 
 # Uploads
 data/uploads/
+
+.env.OLD
+*.OLD
+
