@@ -1,0 +1,310 @@
+import { useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
+import { api, Programme } from "../../api/client";
+import { useToast } from "../../components/ui/Toast";
+
+interface Module {
+  code: string;
+  name: string;
+  credit_units: number;
+  contact_hours_per_week: number;
+  preferred_room_type: string;
+  is_cross_cutting: boolean;
+}
+
+const INTAKES = ["Aug", "Jan", "May"];
+const ACADEMIC_YEARS = ["2025/2026", "2026/2027", "2027/2028"];
+
+export default function RegisterWizard({ onComplete }: { onComplete?: () => void }) {
+  const navigate = useNavigate();
+  const toast = useToast();
+
+  const [step, setStep] = useState(1);
+  const [programmes, setProgrammes] = useState<Programme[]>([]);
+  const [programmeCode, setProgrammeCode] = useState("");
+  const [yearLevel, setYearLevel] = useState(1);
+  const [semester, setSemester] = useState(1);
+  const [intake, setIntake] = useState("Aug");
+  const [academicYear, setAcademicYear] = useState("2026/2027");
+  const [combination, setCombination] = useState<string>("BC");
+  const [mode, setMode] = useState("Day");
+
+  const [cohortId, setCohortId] = useState("");
+  const [modules, setModules] = useState<Module[]>([]);
+  const [totalCU, setTotalCU] = useState(0);
+  const [loadingModules, setLoadingModules] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  // Reset wizard every time it mounts so a re-visit doesn't carry stale data
+  useEffect(() => {
+    setStep(1);
+    setProgrammeCode("");
+    setYearLevel(1);
+    setSemester(1);
+    setIntake("Aug");
+    setAcademicYear("2026/2027");
+    setCombination("BC");
+    setMode("Day");
+    setCohortId("");
+    setModules([]);
+    setTotalCU(0);
+  }, []);
+
+  useEffect(() => {
+    const load = async () => {
+      try {
+        const res = await api.get<Programme[]>("/programmes");
+        setProgrammes(res.data);
+      } catch {
+        toast.show("err", "Failed to load programmes");
+      }
+    };
+    load();
+  }, []);
+
+  const currentProgramme = programmes.find((p) => p.code === programmeCode);
+  const needsCombination = programmeCode === "BSE";
+
+  const loadModules = async () => {
+    if (!programmeCode) {
+      toast.show("err", "Please select a programme");
+      return;
+    }
+    setLoadingModules(true);
+    try {
+      // Build query string manually so academic_year slash is properly encoded
+      const parts = [
+        "programme=" + encodeURIComponent(programmeCode),
+        "year=" + yearLevel,
+        "semester=" + semester,
+        "intake=" + encodeURIComponent(intake),
+        "academic_year=" + encodeURIComponent(academicYear),
+        "mode=" + encodeURIComponent(mode),
+      ];
+      if (needsCombination && combination) {
+        parts.push("combination=" + encodeURIComponent(combination));
+      }
+      const res = await api.get("/cohorts/preview?" + parts.join("&"));
+      setCohortId(res.data.cohort_id);
+      setModules(res.data.modules || []);
+      setTotalCU(res.data.total_credit_units || 0);
+      setStep(2);
+    } catch (e: any) {
+      const msg = e.response?.data?.detail || "No cohort matches that selection yet. Ask admin to create it.";
+      toast.show("err", msg);
+    } finally {
+      setLoadingModules(false);
+    }
+  };
+
+  const save = async () => {
+    if (modules.length === 0) {
+      toast.show("err", "No modules to save");
+      return;
+    }
+    setSaving(true);
+    try {
+      for (const m of modules) {
+        try {
+          await api.post("/enrollments/me", {
+            module_code: m.code,
+            academic_year: academicYear,
+            semester,
+          }, { params: { cohort_id: cohortId } });
+        } catch (inner: any) {
+          // Skip duplicates silently
+          if (inner.response?.status !== 409) throw inner;
+        }
+      }
+      // After enrollment, also set the cohort on the user record via link endpoint fallback.
+      try {
+        await api.post("/enrollments/me/auto-enroll", { cohort_id: cohortId });
+      } catch { /* non-fatal */ }
+
+      toast.show("ok", "Enrolled in " + modules.length + " modules");
+      if (onComplete) onComplete();
+      else navigate("/my-timetable");
+    } catch (e: any) {
+      toast.show("err", e.response?.data?.detail || "Failed to save enrollment");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-gray-50 dark:bg-gray-950 py-12 px-4">
+      <div className="max-w-4xl mx-auto">
+        <div className="flex items-center justify-center gap-2 mb-8">
+          {[1, 2].map((n) => (
+            <div key={n} className="flex items-center gap-2">
+              <div className={"w-10 h-10 rounded-full flex items-center justify-center font-bold " +
+                (step >= n ? "bg-aviu-800 text-white" : "bg-gray-200 dark:bg-gray-700 text-gray-500 dark:text-gray-400")}>
+                {n}
+              </div>
+              {n < 2 && <div className={"w-16 h-1 rounded " + (step > n ? "bg-aviu-800" : "bg-gray-200 dark:bg-gray-700")} />}
+            </div>
+          ))}
+        </div>
+
+        {step === 1 && (
+          <div className="bg-white dark:bg-gray-900 rounded-2xl border border-gray-200 dark:border-gray-800 p-8 shadow-sm">
+            <h1 className="text-2xl font-bold text-gray-900 dark:text-gray-100 mb-2">Your Academic Details</h1>
+            <p className="text-gray-500 dark:text-gray-400 mb-6">
+              Tell us about your programme so we can show you the right modules.
+            </p>
+
+            <div className="grid md:grid-cols-2 gap-4">
+              <div className="md:col-span-2">
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Programme</label>
+                <select value={programmeCode} onChange={(e) => setProgrammeCode(e.target.value)}
+                  className="w-full border rounded-lg px-3 py-2">
+                  <option value="">-- Select your programme --</option>
+                  {programmes.map((p) => (
+                    <option key={p.code} value={p.code}>
+                      {p.code} - {p.name} ({p.level})
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Year of Study</label>
+                <select value={yearLevel} onChange={(e) => setYearLevel(Number(e.target.value))}
+                  className="w-full border rounded-lg px-3 py-2">
+                  {[1, 2, 3, 4, 5, 6].map((y) => <option key={y} value={y}>Year {y}</option>)}
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Semester</label>
+                <select value={semester} onChange={(e) => setSemester(Number(e.target.value))}
+                  className="w-full border rounded-lg px-3 py-2">
+                  <option value={1}>Semester 1</option>
+                  <option value={2}>Semester 2</option>
+                </select>
+              </div>
+
+              {needsCombination && (
+                <div className="md:col-span-2">
+                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                    Teaching Combination (BSE only)
+                  </label>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button type="button" onClick={() => setCombination("BC")}
+                      className={"p-4 rounded-lg border-2 text-left transition " +
+                        (combination === "BC" ? "border-aviu-800 bg-aviu-50 dark:bg-aviu-900/30" : "border-gray-200 dark:border-gray-800 hover:border-aviu-300")}>
+                      <div className="font-bold text-aviu-900">BC</div>
+                      <div className="text-xs text-gray-600 dark:text-gray-400">Biology and Chemistry</div>
+                    </button>
+                    <button type="button" onClick={() => setCombination("MP")}
+                      className={"p-4 rounded-lg border-2 text-left transition " +
+                        (combination === "MP" ? "border-aviu-800 bg-aviu-50 dark:bg-aviu-900/30" : "border-gray-200 dark:border-gray-800 hover:border-aviu-300")}>
+                      <div className="font-bold text-aviu-900">MP</div>
+                      <div className="text-xs text-gray-600 dark:text-gray-400">Mathematics and Physics</div>
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Intake</label>
+                <select value={intake} onChange={(e) => setIntake(e.target.value)}
+                  className="w-full border rounded-lg px-3 py-2">
+                  {INTAKES.map((i) => <option key={i}>{i}</option>)}
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Academic Year</label>
+                <select value={academicYear} onChange={(e) => setAcademicYear(e.target.value)}
+                  className="w-full border rounded-lg px-3 py-2">
+                  {ACADEMIC_YEARS.map((y) => <option key={y}>{y}</option>)}
+                </select>
+              </div>
+
+              <div className="md:col-span-2">
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Mode</label>
+                <select value={mode} onChange={(e) => setMode(e.target.value)}
+                  className="w-full border rounded-lg px-3 py-2">
+                  <option>Day</option>
+                  <option>Weekend</option>
+                </select>
+              </div>
+            </div>
+
+            <div className="flex justify-end gap-2 mt-8">
+              <button onClick={loadModules}
+                disabled={!programmeCode || loadingModules}
+                className="bg-aviu-800 hover:bg-aviu-900 disabled:bg-aviu-300 text-white px-6 py-3 rounded-lg font-semibold">
+                {loadingModules ? "Loading..." : "Continue"}
+              </button>
+            </div>
+          </div>
+        )}
+
+        {step === 2 && (
+          <div className="bg-white dark:bg-gray-900 rounded-2xl border border-gray-200 dark:border-gray-800 p-8 shadow-sm">
+            <div className="flex items-center justify-between mb-6">
+              <div>
+                <h1 className="text-2xl font-bold text-gray-900 dark:text-gray-100">Your Modules</h1>
+                <p className="text-gray-500 dark:text-gray-400 mt-1">
+                  {currentProgramme?.name} - Year {yearLevel} - Semester {semester}
+                  {needsCombination && combination && " - " + combination}
+                </p>
+                <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">Cohort: {cohortId}</p>
+              </div>
+              <button onClick={() => setStep(1)} className="text-sm text-aviu-800 hover:underline">
+                Back
+              </button>
+            </div>
+
+            <div className="bg-aviu-50 dark:bg-aviu-900/30 rounded-lg p-4 mb-4">
+              <div className="text-sm text-gray-700 dark:text-gray-300">
+                <strong>{modules.length}</strong> modules in your curriculum
+              </div>
+              <div className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                Total: <strong>{totalCU}</strong> credit units
+              </div>
+            </div>
+
+            <div className="max-h-[500px] overflow-y-auto space-y-2 pr-2">
+              {modules.map((m) => (
+                <div key={m.code}
+                  className="flex items-center gap-4 p-4 rounded-xl border-2 border-aviu-100 bg-aviu-50 dark:bg-aviu-900/30/40">
+                  <div className="w-8 h-8 rounded-full bg-aviu-800 text-white flex items-center justify-center font-bold text-sm">
+                    OK
+                  </div>
+                  <div className="flex-1">
+                    <div className="flex items-center gap-2">
+                      <span className="font-bold text-sm font-mono">{m.code}</span>
+                      {m.is_cross_cutting && (
+                        <span className="px-1.5 py-0.5 rounded text-xs bg-yellow-100 text-yellow-800 font-medium">
+                          Shared
+                        </span>
+                      )}
+                    </div>
+                    <div className="text-sm text-gray-700 dark:text-gray-300">{m.name}</div>
+                    <div className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                      {m.credit_units} credits - {m.contact_hours_per_week} hrs/week - {m.preferred_room_type}
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div className="flex justify-end gap-2 mt-6 pt-6 border-t">
+              <button onClick={() => setStep(1)}
+                className="bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 text-gray-800 dark:text-gray-200 px-5 py-3 rounded-lg font-medium">
+                Back
+              </button>
+              <button onClick={save} disabled={saving || modules.length === 0}
+                className="bg-aviu-800 hover:bg-aviu-900 disabled:bg-aviu-300 text-white px-6 py-3 rounded-lg font-semibold">
+                {saving ? "Saving..." : "Confirm & Save"}
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

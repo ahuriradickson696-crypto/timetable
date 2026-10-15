@@ -1,0 +1,574 @@
+"""Student & Lecturer portal endpoints -- personal views filtered by enrollment."""
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import Response
+from sqlalchemy.orm import Session
+from sqlalchemy import select, or_
+from typing import List, Optional
+from datetime import datetime, timedelta
+
+from app.db.session import get_db
+from app.api.deps import get_current_user
+from app.models.user import User, UserRole
+from app.models.timetable import TimetableRun, TimetableAssignment
+from app.models.activity import Activity
+from app.models.time_period import TimePeriod
+from app.models.course_unit import CourseUnit
+from app.models.lecturer import Lecturer
+from app.models.cohort import Cohort
+from app.models.programme import Programme
+from app.models.room import Room
+from app.models.enrollment import Enrollment
+from app.schemas.timetable import TimetableCell
+
+router = APIRouter(prefix="/portal", tags=["portal"])
+
+
+def _latest_run(db: Session, run_type: str = "teaching") -> Optional[TimetableRun]:
+    return db.scalar(
+        select(TimetableRun)
+        .where(
+            TimetableRun.status == "success",
+            TimetableRun.run_type == run_type,
+        )
+        .order_by(TimetableRun.id.desc())
+        .limit(1)
+    )
+
+
+def _enrolled_modules(db: Session, student_id: int) -> List[str]:
+    """Return module codes the student is enrolled in."""
+    rows = db.scalars(
+        select(Enrollment.module_code).where(
+            Enrollment.student_id == student_id,
+            Enrollment.status == "enrolled",
+        )
+    )
+    return list(rows)
+
+
+def _build_cells(
+    db: Session,
+    run_id: int,
+    cohort_id: Optional[str] = None,
+    lecturer_id: Optional[str] = None,
+    module_codes: Optional[List[str]] = None,
+) -> List[TimetableCell]:
+    """Build timetable cells, optionally filtered by cohort, lecturer, or enrolled modules."""
+    stmt = (
+        select(TimetableAssignment, Activity, TimePeriod)
+        .join(Activity, TimetableAssignment.activity_id == Activity.id)
+        .join(TimePeriod, TimetableAssignment.period_id == TimePeriod.id)
+        .where(TimetableAssignment.run_id == run_id)
+    )
+
+    if cohort_id:
+        stmt = stmt.where(
+            or_(
+                Activity.cohort_id == cohort_id,
+                Activity.joint_cohort_ids.like(f"%{cohort_id}%"),
+            )
+        )
+
+    if lecturer_id:
+        stmt = stmt.where(Activity.lecturer_id == lecturer_id)
+
+    # THE KEY FILTER: only show modules the student is enrolled in
+    if module_codes is not None:
+        if not module_codes:
+            return []  # No enrollments = no timetable
+        stmt = stmt.where(Activity.module_code.in_(module_codes))
+
+    rows = db.execute(stmt).all()
+    cells: List[TimetableCell] = []
+    for assn, act, per in rows:
+        cu = db.get(CourseUnit, act.module_code)
+        lect = db.get(Lecturer, act.lecturer_id)
+        cells.append(TimetableCell(
+            day=per.day,
+            period_id=per.period_id,
+            start_time=per.start_time,
+            end_time=per.end_time,
+            activity_id=act.id,
+            module_code=act.module_code,
+            module_name=cu.name if cu else None,
+            cohort_id=act.cohort_id,
+            lecturer_id=act.lecturer_id,
+            lecturer_name=lect.full_name if lect else None,
+            room_code=assn.room_code,
+            is_break=per.is_break,
+            assignment_id=assn.id,
+            is_manual=assn.is_manual,
+            is_locked=assn.is_locked,
+        ))
+    return cells
+
+
+def _my_cells(db: Session, current: User, run_type: str = "teaching") -> List[TimetableCell]:
+    """Return the current user's personal timetable cells."""
+    if current.role == UserRole.STUDENT:
+        if not current.cohort_id:
+            raise HTTPException(400, "No cohort linked to this student account")
+        run = _latest_run(db, run_type)
+        if not run:
+            return []
+        modules = _enrolled_modules(db, current.id)
+        return _build_cells(db, run.id, cohort_id=current.cohort_id, module_codes=modules)
+
+    elif current.role == UserRole.LECTURER:
+        if not current.lecturer_id:
+            raise HTTPException(400, "No lecturer ID linked to this account")
+        run = _latest_run(db, run_type)
+        if not run:
+            return []
+        return _build_cells(db, run.id, lecturer_id=current.lecturer_id)
+    return []
+
+
+# ============================================================
+# Portal info
+# ============================================================
+@router.get("/me")
+def portal_me(db: Session = Depends(get_db), current: User = Depends(get_current_user)):
+    cohort = db.get(Cohort, current.cohort_id) if current.cohort_id else None
+    programme = db.get(Programme, cohort.programme_code) if cohort else None
+
+    # Enrollment count for students
+    enrollment_count = 0
+    enrollment_credits = 0
+    if current.role == UserRole.STUDENT:
+        enrollments = list(db.scalars(
+            select(Enrollment).where(
+                Enrollment.student_id == current.id,
+                Enrollment.status == "enrolled",
+            )
+        ))
+        enrollment_count = len(enrollments)
+        for e in enrollments:
+            cu = db.get(CourseUnit, e.module_code)
+            if cu:
+                enrollment_credits += cu.credit_units or 0
+
+    return {
+        "id": current.id,
+        "email": current.email,
+        "full_name": current.full_name,
+        "role": current.role.value,
+        "cohort_id": current.cohort_id,
+        "lecturer_id": current.lecturer_id,
+        "cohort_name": cohort.id if cohort else None,
+        "programme_name": programme.name if programme else None,
+        "year_level": cohort.year_level if cohort else None,
+        "mode": cohort.mode if cohort else None,
+        "intake": cohort.intake if cohort else None,
+        "academic_year": cohort.academic_year if cohort else None,
+        "semester": cohort.semester if cohort else None,
+        "enrollment_count": enrollment_count,
+        "enrollment_credits": enrollment_credits,
+    }
+
+
+@router.get("/my-timetable", response_model=List[TimetableCell])
+def my_timetable(db: Session = Depends(get_db), current: User = Depends(get_current_user)):
+    """Only classes for modules the student is enrolled in."""
+    return _my_cells(db, current, "teaching")
+
+
+# ============================================================
+# Next class
+# ============================================================
+@router.get("/my-next-class")
+def my_next_class(db: Session = Depends(get_db), current: User = Depends(get_current_user)):
+    cells = _my_cells(db, current, "teaching")
+    if not cells:
+        return {"next": None, "message": "No classes scheduled"}
+
+    now = datetime.now()
+    today_name = now.strftime("%A")
+    current_time_str = now.strftime("%H:%M")
+
+    day_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    entries = []
+    for c in cells:
+        if not c.module_code:
+            continue
+        try:
+            day_idx = day_order.index(c.day)
+        except ValueError:
+            continue
+        entries.append((day_idx, c.start_time, c))
+
+    entries.sort(key=lambda x: (x[0], x[1]))
+    today_idx = day_order.index(today_name) if today_name in day_order else 0
+
+    next_today = None
+    for day_idx, start, cell in entries:
+        if day_idx != today_idx:
+            continue
+        if start > current_time_str:
+            next_today = (day_idx, start, cell)
+            break
+
+    if next_today:
+        day_idx, start, cell = next_today
+        h, m = map(int, start.split(":"))
+        class_dt = now.replace(hour=h, minute=m, second=0, microsecond=0)
+        delta = class_dt - now
+        minutes_until = int(delta.total_seconds() / 60)
+        return {
+            "next": {
+                "day": cell.day,
+                "is_today": True,
+                "start_time": cell.start_time,
+                "end_time": cell.end_time,
+                "module_code": cell.module_code,
+                "module_name": cell.module_name,
+                "room_code": cell.room_code,
+                "lecturer_name": cell.lecturer_name,
+                "activity_id": cell.activity_id,
+                "minutes_until": minutes_until,
+            },
+            "message": f"Next class in {minutes_until} minutes"
+        }
+
+    for day_idx, start, cell in entries:
+        if day_idx > today_idx:
+            return {
+                "next": {
+                    "day": cell.day,
+                    "is_today": False,
+                    "days_until": day_idx - today_idx,
+                    "start_time": cell.start_time,
+                    "end_time": cell.end_time,
+                    "module_code": cell.module_code,
+                    "module_name": cell.module_name,
+                    "room_code": cell.room_code,
+                    "lecturer_name": cell.lecturer_name,
+                    "activity_id": cell.activity_id,
+                },
+                "message": f"Next class on {cell.day}"
+            }
+
+    return {"next": None, "message": "No upcoming classes"}
+
+
+@router.get("/my-today")
+def my_today(db: Session = Depends(get_db), current: User = Depends(get_current_user)):
+    cells = _my_cells(db, current, "teaching")
+    today_name = datetime.now().strftime("%A")
+    todays = [c for c in cells if c.day == today_name and c.module_code]
+    todays.sort(key=lambda c: c.start_time)
+    return {
+        "day": today_name,
+        "classes": [
+            {
+                "start_time": c.start_time,
+                "end_time": c.end_time,
+                "module_code": c.module_code,
+                "module_name": c.module_name,
+                "room_code": c.room_code,
+                "lecturer_name": c.lecturer_name,
+                "activity_id": c.activity_id,
+            }
+            for c in todays
+        ],
+    }
+
+
+# ============================================================
+# My Exams -- filtered by enrolled modules
+# ============================================================
+@router.get("/my-exams")
+def my_exams(db: Session = Depends(get_db), current: User = Depends(get_current_user)):
+    if current.role == UserRole.STUDENT and not current.cohort_id:
+        raise HTTPException(400, "No cohort linked to this account")
+
+    result = {"exam": [], "test": []}
+
+    for rt in ("exam", "test"):
+        run = _latest_run(db, rt)
+        if not run:
+            continue
+
+        if current.role == UserRole.STUDENT:
+            modules = _enrolled_modules(db, current.id)
+            cells = _build_cells(db, run.id, cohort_id=current.cohort_id, module_codes=modules)
+        elif current.role == UserRole.LECTURER:
+            cells = _build_cells(db, run.id, lecturer_id=current.lecturer_id)
+        else:
+            cells = _build_cells(db, run.id)
+
+        by_day = {}
+        for c in cells:
+            if not c.module_code:
+                continue
+            by_day.setdefault(c.day, []).append({
+                "start_time": c.start_time,
+                "end_time": c.end_time,
+                "module_code": c.module_code,
+                "module_name": c.module_name,
+                "room_code": c.room_code,
+                "lecturer_name": c.lecturer_name,
+            })
+        day_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+        sorted_days = []
+        for d in day_order:
+            if d in by_day:
+                by_day[d].sort(key=lambda x: x["start_time"])
+                sorted_days.append({"day": d, "sessions": by_day[d]})
+
+        result[rt] = {
+            "run_id": run.id,
+            "message": run.message,
+            "days": sorted_days,
+            "total": sum(len(v["sessions"]) for v in sorted_days),
+        }
+    return result
+
+
+# ============================================================
+# Activity details
+# ============================================================
+@router.get("/activity/{activity_id}/details")
+def activity_details(
+    activity_id: str,
+    db: Session = Depends(get_db),
+    current: User = Depends(get_current_user),
+):
+    act = db.get(Activity, activity_id)
+    if not act:
+        raise HTTPException(404, "Activity not found")
+
+    # For students: must be enrolled in this module
+    if current.role == UserRole.STUDENT:
+        enrolled = db.scalar(
+            select(Enrollment).where(
+                Enrollment.student_id == current.id,
+                Enrollment.module_code == act.module_code,
+                Enrollment.status == "enrolled",
+            )
+        )
+        if not enrolled:
+            raise HTTPException(403, "You are not enrolled in this module")
+
+    if current.role == UserRole.LECTURER and act.lecturer_id != current.lecturer_id:
+        raise HTTPException(403, "Not allowed")
+
+    cu = db.get(CourseUnit, act.module_code)
+    lect = db.get(Lecturer, act.lecturer_id)
+    cohort = db.get(Cohort, act.cohort_id)
+    programme = db.get(Programme, cohort.programme_code) if cohort else None
+
+    return {
+        "id": act.id,
+        "module_code": act.module_code,
+        "module_name": cu.name if cu else None,
+        "credit_units": cu.credit_units if cu else None,
+        "contact_hours_per_week": cu.contact_hours_per_week if cu else None,
+        "normal_year": cu.normal_year if cu else None,
+        "is_cross_cutting": cu.is_cross_cutting if cu else None,
+        "owning_school": cu.owning_school if cu else None,
+        "notes": cu.notes if cu else None,
+        "lecturer_id": act.lecturer_id,
+        "lecturer_name": lect.full_name if lect else None,
+        "lecturer_email": lect.email if lect else None,
+        "lecturer_preferred_mode": lect.preferred_mode if lect else None,
+        "cohort_id": act.cohort_id,
+        "cohort_size": cohort.estimated_students if cohort else None,
+        "programme_code": programme.code if programme else None,
+        "programme_name": programme.name if programme else None,
+        "duration_periods": act.duration_periods,
+        "students": act.students,
+        "preferred_room_type": act.preferred_room_type,
+        "activity_type": act.activity_type,
+    }
+
+
+# ============================================================
+# Exports (filtered by enrollment + beautiful layout)
+# ============================================================
+def _student_info_for_export(db: Session, current: User) -> dict:
+    """Build a dict of student info to display in exported files."""
+    info = {
+        "Name": current.full_name,
+        "Email": current.email,
+    }
+    from app.models.student_record import StudentRecord
+    sr = db.scalar(select(StudentRecord).where(StudentRecord.user_id == current.id))
+    if sr:
+        info["Student No."] = sr.student_number
+        info["Programme"] = sr.programme_code
+        info["Year"] = "Year " + str(sr.year_level)
+        info["Semester"] = "Semester " + str(sr.semester)
+        if sr.combination:
+            info["Combination"] = sr.combination
+        info["Academic Year"] = sr.academic_year
+        info["Intake"] = sr.intake
+        info["Mode"] = sr.mode
+    elif current.cohort_id:
+        cohort = db.get(Cohort, current.cohort_id)
+        if cohort:
+            info["Cohort"] = cohort.id
+            info["Year"] = "Year " + str(cohort.year_level)
+            info["Semester"] = "Semester " + str(cohort.semester)
+            info["Academic Year"] = cohort.academic_year
+    return info
+
+
+@router.get("/my-timetable/ical")
+def my_timetable_ical(db: Session = Depends(get_db), current: User = Depends(get_current_user)):
+    from app.services.student_export import build_student_ical
+    cells = _my_cells(db, current, "teaching")
+    title = current.full_name + " - Timetable"
+    content = build_student_ical(title, cells)
+    safe_name = current.full_name.replace(" ", "_").replace("/", "-")
+    return Response(
+        content=content,
+        media_type="text/calendar",
+        headers={"Content-Disposition": "attachment; filename=timetable_" + safe_name + ".ics"},
+    )
+
+
+@router.get("/my-timetable/pdf")
+def my_timetable_pdf(db: Session = Depends(get_db), current: User = Depends(get_current_user)):
+    from app.services.student_export import build_student_pdf
+    cells = _my_cells(db, current, "teaching")
+    info = _student_info_for_export(db, current)
+    title = "Timetable - " + current.full_name
+    data = build_student_pdf(title, info, cells)
+    safe_name = current.full_name.replace(" ", "_").replace("/", "-")
+    return Response(
+        content=data,
+        media_type="application/pdf",
+        headers={"Content-Disposition": "attachment; filename=timetable_" + safe_name + ".pdf"},
+    )
+
+
+@router.get("/my-timetable/excel")
+def my_timetable_excel(db: Session = Depends(get_db), current: User = Depends(get_current_user)):
+    from app.services.student_export import build_student_excel
+    cells = _my_cells(db, current, "teaching")
+    info = _student_info_for_export(db, current)
+    title = "Timetable - " + current.full_name
+    data = build_student_excel(title, info, cells)
+    safe_name = current.full_name.replace(" ", "_").replace("/", "-")
+    return Response(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=timetable_" + safe_name + ".xlsx"},
+    )
+
+# ============================================================
+# LECTURER: my modules
+# ============================================================
+@router.get("/my-modules")
+def my_modules(
+    db: Session = Depends(get_db),
+    current: User = Depends(get_current_user),
+):
+    """List every module this lecturer teaches (from Activity records)."""
+    if current.role != UserRole.LECTURER:
+        raise HTTPException(400, "Only lecturers can use this endpoint")
+
+    if not current.lecturer_id:
+        return []
+
+    activities = db.query(Activity).filter(Activity.lecturer_id == current.lecturer_id).all()
+    seen = {}
+    for a in activities:
+        cu = db.get(CourseUnit, a.module_code)
+        if a.module_code not in seen:
+            seen[a.module_code] = {
+                "code": a.module_code,
+                "name": cu.name if cu else "",
+                "credit_units": cu.credit_units if cu else None,
+                "contact_hours_per_week": cu.contact_hours_per_week if cu else None,
+                "preferred_room_type": cu.preferred_room_type if cu else None,
+                "is_cross_cutting": cu.is_cross_cutting if cu else False,
+                "cohorts": [],
+                "activity_count": 0,
+            }
+        if a.cohort_id and a.cohort_id not in seen[a.module_code]["cohorts"]:
+            seen[a.module_code]["cohorts"].append(a.cohort_id)
+        seen[a.module_code]["activity_count"] += 1
+
+    return sorted(seen.values(), key=lambda x: x["code"])
+
+
+# ============================================================
+# LECTURER: my cohorts
+# ============================================================
+@router.get("/my-cohorts")
+def my_cohorts(
+    db: Session = Depends(get_db),
+    current: User = Depends(get_current_user),
+):
+    """List every cohort this lecturer teaches."""
+    if current.role != UserRole.LECTURER:
+        raise HTTPException(400, "Only lecturers can use this endpoint")
+
+    if not current.lecturer_id:
+        return []
+
+    activities = db.query(Activity).filter(Activity.lecturer_id == current.lecturer_id).all()
+    seen = {}
+    for a in activities:
+        if not a.cohort_id:
+            continue
+        if a.cohort_id not in seen:
+            c = db.get(Cohort, a.cohort_id)
+            prog = db.get(Programme, c.programme_code) if c else None
+            seen[a.cohort_id] = {
+                "id": a.cohort_id,
+                "programme_code": c.programme_code if c else None,
+                "programme_name": prog.name if prog else None,
+                "year_level": c.year_level if c else None,
+                "mode": c.mode if c else None,
+                "intake": c.intake if c else None,
+                "academic_year": c.academic_year if c else None,
+                "semester": c.semester if c else None,
+                "estimated_students": c.estimated_students if c else None,
+                "modules": [],
+                "student_count": 0,
+            }
+        if a.module_code not in seen[a.cohort_id]["modules"]:
+            seen[a.cohort_id]["modules"].append(a.module_code)
+
+    # Count enrolled students per cohort
+    for cid in seen:
+        n = db.query(User).filter(User.cohort_id == cid, User.role == UserRole.STUDENT).count()
+        seen[cid]["student_count"] = n
+
+    return sorted(seen.values(), key=lambda x: x["id"])
+
+
+# ============================================================
+# LECTURER: class roster for an activity
+# ============================================================
+@router.get("/activity/{activity_id}/students")
+def activity_students(
+    activity_id: str,
+    db: Session = Depends(get_db),
+    current: User = Depends(get_current_user),
+):
+    """Return the students enrolled in the module + cohort for an activity."""
+    if current.role not in (UserRole.LECTURER, UserRole.ADMIN, UserRole.OFFICER):
+        raise HTTPException(403, "Not allowed")
+
+    a = db.query(Activity).filter(Activity.id == activity_id).first()
+    if not a:
+        raise HTTPException(404, "Activity not found")
+
+    # Get the students in the cohort
+    students = db.query(User).filter(
+        User.cohort_id == a.cohort_id,
+        User.role == UserRole.STUDENT,
+    ).all()
+
+    return [
+        {
+            "id": s.id,
+            "full_name": s.full_name,
+            "email": s.email,
+        }
+        for s in students
+    ]

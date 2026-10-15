@@ -1,0 +1,70 @@
+"""Analytics and reporting endpoints."""
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from typing import Optional
+
+from app.db.session import get_db
+from app.api.deps import get_current_user
+from app.models.user import User
+from app.models.timetable import TimetableRun
+from app.services import analytics
+
+
+router = APIRouter(prefix="/analytics", tags=["analytics"])
+
+
+def _check_run(db: Session, run_id: int) -> TimetableRun:
+    run = db.get(TimetableRun, run_id)
+    if not run:
+        raise HTTPException(404, "Run not found")
+    if run.status != "success":
+        raise HTTPException(400, "Analytics only available for successful runs")
+    return run
+
+
+@router.get("/runs/{run_id}/rooms")
+def room_stats(run_id: int, db: Session = Depends(get_db), _: User = Depends(get_current_user)):
+    _check_run(db, run_id)
+    return analytics.room_utilisation(db, run_id)
+
+
+@router.get("/runs/{run_id}/lecturers")
+def lecturer_stats(run_id: int, db: Session = Depends(get_db), _: User = Depends(get_current_user)):
+    _check_run(db, run_id)
+    return analytics.lecturer_load(db, run_id)
+
+
+@router.get("/runs/{run_id}/programmes")
+def programme_stats(run_id: int, db: Session = Depends(get_db), _: User = Depends(get_current_user)):
+    _check_run(db, run_id)
+    return analytics.programme_summary(db, run_id)
+
+
+@router.get("/runs/{run_id}/cohorts")
+def cohort_stats(run_id: int, db: Session = Depends(get_db), _: User = Depends(get_current_user)):
+    _check_run(db, run_id)
+    return analytics.cohort_load(db, run_id)
+
+
+@router.get("/runs/{run_id}/free-slots")
+def free_slots_endpoint(
+    run_id: int,
+    room_code: Optional[str] = None,
+    day: Optional[str] = None,
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    _check_run(db, run_id)
+    return analytics.free_slots(db, run_id, room_code=room_code, day=day)
+
+
+@router.get("/runs/{run_id}/dashboard")
+def full_dashboard(run_id: int, db: Session = Depends(get_db), _: User = Depends(get_current_user)):
+    """All analytics in one call for the dashboard."""
+    _check_run(db, run_id)
+    return {
+        "rooms": analytics.room_utilisation(db, run_id),
+        "lecturers": analytics.lecturer_load(db, run_id),
+        "programmes": analytics.programme_summary(db, run_id),
+        "cohorts": analytics.cohort_load(db, run_id),
+    }
