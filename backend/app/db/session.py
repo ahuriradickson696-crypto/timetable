@@ -1,30 +1,21 @@
-﻿"""Database session and engine."""
+"""Database session -- reads DATABASE_URL from env (Render disk) or defaults to local file."""
+import os
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, Session
-from typing import Generator
-from app.config import settings
+from sqlalchemy.orm import sessionmaker, declarative_base
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./aviu_timetable.db")
+
+connect_args = {}
+if DATABASE_URL.startswith("sqlite"):
+    connect_args = {"check_same_thread": False}
+
+engine = create_engine(DATABASE_URL, connect_args=connect_args, echo=False)
+SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+
+Base = declarative_base()
 
 
-# SQLite needs check_same_thread=False; Postgres ignores it
-connect_args = {"check_same_thread": False} if settings.DATABASE_URL.startswith("sqlite") else {}
-
-engine = create_engine(
-    settings.DATABASE_URL,
-    connect_args=connect_args,
-    echo=settings.DEBUG,
-    future=True,
-)
-
-SessionLocal = sessionmaker(
-    bind=engine,
-    autoflush=False,
-    autocommit=False,
-    expire_on_commit=False,
-)
-
-
-def get_db() -> Generator[Session, None, None]:
-    """FastAPI dependency: yields a DB session."""
+def get_db():
     db = SessionLocal()
     try:
         yield db

@@ -37,13 +37,34 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# ─── CORS ───
+import os as _os
+_origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+# Add any origins from CORS_ORIGINS env var (comma-separated)
+_extra = _os.environ.get("CORS_ORIGINS", "")
+if _extra:
+    _origins.extend([o.strip() for o in _extra.split(",") if o.strip()])
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
+    allow_origins=_origins,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── CORS ── allow LAN + localhost + deployed domains
+import os as _os
+_allowed = ["http://localhost:5173", "http://127.0.0.1:5173"]
+_extra = _os.environ.get("CORS_ORIGINS", "")
+if _extra:
+    _allowed.extend([o.strip() for o in _extra.split(",") if o.strip()])
+# Allow any private-LAN IP on ports 5173
+
+
 
 # ---------- API routers ----------
 app.include_router(auth_router.router)
@@ -96,3 +117,9 @@ else:
             "db": "mongodb",
             "note": "Frontend not built yet — only /api/* and /docs are available",
         }
+
+if __name__ == "__main__":
+    import os
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("app.main:app", host="0.0.0.0", port=port)

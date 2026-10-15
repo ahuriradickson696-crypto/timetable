@@ -1,6 +1,8 @@
 import axios from "axios";
 
-const API_BASE = "http://localhost:8000/api/v1";
+// Auto-detect host: works on localhost, LAN IP, and deployed domains
+const HOST = window.location.hostname;
+const API_BASE = `http://${HOST}:8000/api/v1`;
 
 export const api = axios.create({
   baseURL: API_BASE,
@@ -9,9 +11,7 @@ export const api = axios.create({
 
 api.interceptors.request.use((config) => {
   const token = localStorage.getItem("aviu_token");
-  if (token) {
-    config.headers.Authorization = `Bearer ${token}`;
-  }
+  if (token) config.headers.Authorization = `Bearer ${token}`;
   return config;
 });
 
@@ -75,7 +75,7 @@ export interface CourseUnit {
   active: boolean;
   notes?: string;
   shared_across_programmes: string[];
-  }
+}
 
 export interface Lecturer {
   id: string;
@@ -86,7 +86,7 @@ export interface Lecturer {
   active: boolean;
   notes?: string;
   can_teach_modules: string[];
-  }
+}
 
 export interface Room {
   code: string;
@@ -177,10 +177,7 @@ export interface ChangeLogEntry {
   details?: string;
   timestamp: string;
 }
-/**
- * Download a file from an authenticated endpoint.
- * Fetches it with the Bearer token, then triggers a browser download.
- */
+
 export async function downloadFile(url: string, filename: string) {
   try {
     const token = localStorage.getItem("aviu_token");
