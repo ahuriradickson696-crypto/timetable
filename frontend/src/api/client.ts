@@ -1,8 +1,8 @@
 import axios from "axios";
 
-// Auto-detect host: works on localhost, LAN IP, and deployed domains
-const HOST = window.location.hostname;
-const API_BASE = `http://${HOST}:8000/api/v1`;
+// Read from VITE_API_URL (set on Render) or fall back to localhost
+const RAW_BASE = (import.meta.env.VITE_API_URL as string) || "http://localhost:8000";
+const API_BASE = RAW_BASE.replace(/\/api\/v1$/, "") + "/api/v1";
 
 export const api = axios.create({
   baseURL: API_BASE,

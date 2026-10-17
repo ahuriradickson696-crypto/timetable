@@ -1,4 +1,4 @@
-"""Database session -- reads DATABASE_URL from env (Render disk) or defaults to local file."""
+"""Database session — reads DATABASE_URL from env (Render disk) or defaults to local file."""
 import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
@@ -11,7 +11,6 @@ if DATABASE_URL.startswith("sqlite"):
 
 engine = create_engine(DATABASE_URL, connect_args=connect_args, echo=False)
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
-
 Base = declarative_base()
 
 
